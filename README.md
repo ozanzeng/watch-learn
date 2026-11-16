@@ -2,8 +2,6 @@
 
 YouTube videolarını Claude Code'a "izlettiren" bir pipeline. Transcript + ekran görüntülerini birleştirerek bir storyboard grid oluşturur, Claude bunu Vision LLM ile analiz eder ve bilgileri `docs/wiki/` altında Obsidian formatında saklar.
 
-[oguzcankaraman/Watch_Youtube_Skill](https://github.com/oguzcankaraman/Watch_Youtube_Skill) üzerine kurulmuştur.
-
 ## Nasıl Çalışır
 
 ```
