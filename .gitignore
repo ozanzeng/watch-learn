@@ -2,6 +2,14 @@ output/
 .venv/
 venv/
 __pycache__/
+*.py[cod]
 docs/wiki/
 .DS_Store
 *.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.tmp

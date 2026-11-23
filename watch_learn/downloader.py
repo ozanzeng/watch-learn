@@ -1,16 +1,16 @@
 """Download YouTube transcripts, audio, and video via yt-dlp."""
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import time
-import logging
 from pathlib import Path
 
-import yt_dlp
 import webvtt
+import yt_dlp
 
 from . import DownloadResult, TranscriptEntry
 
@@ -20,23 +20,35 @@ logger = logging.getLogger(__name__)
 # asıl İngilizce altyazı "en-orig" adıyla gelir, bu yüzden ayrı grup olarak önce denenir.
 _SUBTITLE_LANG_GROUPS = (("tr", "tr-orig"), ("en-orig",), ("en", "en-US", "en-GB"))
 
-_TIMECODE_RE = re.compile(r"(\d+):(\d{2}):(\d{2})[.,](\d+)")
+_VIDEO_ID_RE = re.compile(
+    r"(?:[?&]v=|youtu\.be/|/embed/|/shorts/|/live/|/v/)([A-Za-z0-9_-]{11})"
+)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ASS_TAG_RE = re.compile(r"\{\\[^}]*\}")
 _WHITESPACE_RE = re.compile(r"\s+")
 # whisper writes music/noise as "[Music]", "(müzik)", "♪ ... ♪"; those are not speech
 _NON_SPEECH_RE = re.compile(r"[\[(*♪][^\[\]()*♪]*[\])*♪]")
+# A rolling caption repeats the previous text and appends new words; merge those cues.
+_ROLLING_WINDOW = 0.75
+
+_YTDLP_COMMON_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "noprogress": True,
+    "noplaylist": True,
+    "retries": 3,
+    "fragment_retries": 3,
+    "socket_timeout": 30,
+}
+
+_AUDIO_TIMEOUT = 600
+_TRANSCRIBE_TIMEOUT = 3600
 
 
 def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from URL. Falls back to 'unknown'."""
-    patterns = [
-        r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, url)
-        if m:
-            return m.group(1)
-    return "unknown"
+    """Extract a YouTube video ID from a URL. Falls back to 'unknown'."""
+    match = _VIDEO_ID_RE.search(url)
+    return match.group(1) if match else "unknown"
 
 
 def download_video(
@@ -49,12 +61,19 @@ def download_video(
     """Orchestrate transcript + video download with Whisper fallback."""
     video_id = extract_video_id(url)
     transcript_path, fmt = _download_transcript(url, output_dir)
-    video_path, title = _download_video_file(url, output_dir)
+    video_path, title, info_id = _download_video_file(url, output_dir)
+    if info_id:
+        video_id = info_id
 
     if transcript_path is not None:
         entries = _parse_transcript_file(transcript_path, fmt)
         source = fmt
         logger.debug(f"Parsed {len(entries)} entries from {fmt} transcript")
+        if not entries:
+            logger.warning(f"{fmt} transcript was empty; falling back to audio transcription")
+            entries, source = _transcribe_fallback(
+                video_path, output_dir, groq_api_key, whisper_model, language,
+            )
     else:
         entries, source = _transcribe_fallback(
             video_path, output_dir, groq_api_key, whisper_model, language,
@@ -84,7 +103,9 @@ def load_local_video(
         sidecar = path.with_suffix(f".{ext}")
         if sidecar.exists():
             entries, source = _parse_transcript_file(sidecar, ext), ext
-            break
+            if entries:
+                break
+            logger.warning(f"{sidecar.name} was empty; ignoring it")
     else:
         entries, source = _transcribe_fallback(path, output_dir, groq_api_key, whisper_model, language)
 
@@ -116,8 +137,10 @@ def _transcribe_fallback(
         try:
             entries = _transcribe_with_whisper_cpp(video_path, work_dir, whisper_model, language)
             logger.debug(f"whisper.cpp returned {len(entries)} entries")
-            return entries, "whisper.cpp"
-        except RuntimeError as e:
+            if entries:
+                return entries, "whisper.cpp"
+            logger.warning("whisper.cpp returned no speech segments")
+        except Exception as e:
             logger.warning(f"whisper.cpp failed: {e}")
 
     if groq_api_key:
@@ -126,8 +149,10 @@ def _transcribe_fallback(
             audio_path = _extract_audio(video_path, work_dir / "audio.mp3")
             entries = _transcribe_with_whisper(audio_path, groq_api_key)
             logger.debug(f"Whisper returned {len(entries)} entries")
-            return entries, "whisper"
-        except RuntimeError as e:
+            if entries:
+                return entries, "whisper"
+            logger.warning("Groq Whisper returned no speech segments")
+        except Exception as e:
             logger.warning(f"Groq Whisper failed: {e}")
 
     logger.warning("No transcript, no whisper.cpp model and no GROQ_API_KEY — frames will be evenly spaced")
@@ -136,15 +161,13 @@ def _transcribe_fallback(
 
 def _download_transcript(url: str, output_dir: Path) -> tuple[Path | None, str]:
     """Try manual then auto-generated subtitles; return (path, format) or (None, 'none')."""
-    last_error: yt_dlp.utils.DownloadError | None = None
+    last_error: Exception | None = None
     # Dil grupları sırayla denenir; ilk başarılı grupta durulur. Hepsini tek istekte
     # istemek, çevrilmiş (en) altyazıda 429 alıp bulunmuş tr altyazısını da boşa çıkarıyordu.
     for langs in _SUBTITLE_LANG_GROUPS:
         opts = {
+            **_YTDLP_COMMON_OPTS,
             "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
             "writesubtitles": True,
             "writeautomaticsub": True,
             "subtitleslangs": list(langs),
@@ -154,12 +177,12 @@ def _download_transcript(url: str, output_dir: Path) -> tuple[Path | None, str]:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
-        except yt_dlp.utils.DownloadError as e:
+        except Exception as e:
             last_error = e
 
         for ext in ("vtt", "srt"):
             for lang in langs:
-                matches = list(output_dir.glob(f"*.{lang}.{ext}"))
+                matches = sorted(output_dir.glob(f"*.{lang}.{ext}"))
                 if matches:
                     return matches[0], ext
 
@@ -172,26 +195,34 @@ def _download_transcript(url: str, output_dir: Path) -> tuple[Path | None, str]:
 
 def _extract_audio(video_path: Path, out_path: Path) -> Path:
     """Extract mono audio with ffmpeg: 16 kHz WAV for whisper.cpp, 64 kbps MP3 for Groq."""
-    if out_path.suffix == ".wav":
-        codec = ["-ar", "16000", "-c:a", "pcm_s16le"]
-    else:
-        codec = ["-ar", "16000", "-b:a", "64k"]
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vn", "-ac", "1", *codec, str(out_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    codec = (
+        ["-ar", "16000", "-c:a", "pcm_s16le"]
+        if out_path.suffix == ".wav"
+        else ["-ar", "16000", "-b:a", "64k"]
+    )
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+        "-i", str(video_path), "-vn", "-ac", "1", *codec, str(out_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_AUDIO_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"audio extraction timed out after {_AUDIO_TIMEOUT}s") from e
     if result.returncode != 0 or not out_path.exists():
         raise RuntimeError(f"audio extraction failed: {result.stderr.strip()[-200:]}")
     return out_path
 
 
-def _download_video_file(url: str, output_dir: Path) -> tuple[Path, str]:
-    """Download an MP4 (max 720p) for frame extraction; return (path, title)."""
+def _download_video_file(url: str, output_dir: Path) -> tuple[Path, str, str]:
+    """Download an MP4 (max 720p) for frame extraction; return (path, title, video_id)."""
     opts = {
+        **_YTDLP_COMMON_OPTS,
         "outtmpl": str(output_dir / "%(id)s_video.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
         # 720p üstü kare çıkarma için gereksiz; indirme süresini ve disk kullanımını düşürür
-        "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "format": (
+            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        ),
         "merge_output_format": "mp4",
     }
     try:
@@ -200,13 +231,13 @@ def _download_video_file(url: str, output_dir: Path) -> tuple[Path, str]:
     except yt_dlp.utils.DownloadError as e:
         raise ValueError(f"Cannot access video: {e}") from e
 
-    matches = list(output_dir.glob("*_video.mp4"))
+    matches = sorted(output_dir.glob("*_video.mp4"))
     if not matches:
         # Some videos download without the _video suffix when merge happens
-        matches = list(output_dir.glob("*.mp4"))
+        matches = sorted(output_dir.glob("*.mp4"))
     if not matches:
         raise RuntimeError("Video download produced no .mp4 file")
-    return matches[0], info.get("title") or ""
+    return matches[0], info.get("title") or "", info.get("id") or ""
 
 
 def _transcribe_with_whisper_cpp(
@@ -223,7 +254,10 @@ def _transcribe_with_whisper_cpp(
         "-t", str(min(8, os.cpu_count() or 4)),
         "-f", str(wav_path), "-oj", "-of", str(out_base), "-np",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TRANSCRIBE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"whisper.cpp timed out after {_TRANSCRIBE_TIMEOUT}s") from e
     json_path = out_base.with_suffix(".json")
     if result.returncode != 0 or not json_path.exists():
         raise RuntimeError(result.stderr.strip()[-300:] or "no JSON output")
@@ -248,6 +282,7 @@ def _transcribe_with_whisper(audio_path: Path, api_key: str) -> list[TranscriptE
     from groq import Groq, RateLimitError
 
     client = Groq(api_key=api_key)
+    response = None
 
     for attempt in range(2):
         try:
@@ -265,6 +300,11 @@ def _transcribe_with_whisper(audio_path: Path, api_key: str) -> list[TranscriptE
                 time.sleep(60)
             else:
                 raise
+        except Exception as e:
+            raise RuntimeError(f"Groq Whisper request failed: {e}") from e
+
+    if response is None:
+        raise RuntimeError("Groq Whisper returned no response")
 
     entries = []
     for seg in response.segments or []:
@@ -285,45 +325,75 @@ def _parse_transcript_file(path: Path, fmt: str) -> list[TranscriptEntry]:
 
 
 def _parse_vtt(path: Path) -> list[TranscriptEntry]:
-    """Parse WebVTT using webvtt-py; strips HTML tags and deduplicates rolling-window lines."""
-    entries = []
+    """Parse WebVTT using webvtt-py; strips tags and merges rolling-window captions."""
     try:
         captions = webvtt.read(str(path))
     except Exception:
-        # Some auto-captions have malformed headers; fall back to raw read
-        captions = webvtt.read_buffer(path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True))
+        # Some auto-captions have malformed headers; try a buffer read, then raw regex.
+        try:
+            captions = webvtt.from_buffer(
+                path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            )
+        except Exception:
+            logger.warning(f"{path.name} is not valid WebVTT; parsing it as SRT-style cues")
+            return _parse_srt(path)
 
+    entries: list[TranscriptEntry] = []
     seen: set[str] = set()
     for cap in captions:
         clean = _HTML_TAG_RE.sub("", cap.text)
+        clean = _ASS_TAG_RE.sub("", clean)
         clean = _WHITESPACE_RE.sub(" ", clean).strip()
-        if not clean or clean in seen:
+        if not clean:
             continue
+        start = _timecode_to_seconds(cap.start)
+        end = _timecode_to_seconds(cap.end)
+
+        if clean in seen:
+            # Exact repeat: just extend the previous cue instead of duplicating text
+            if entries and entries[-1].text == clean:
+                entries[-1].end_sec = max(entries[-1].end_sec, end)
+            continue
+
+        if entries and _is_rolling_caption(entries[-1], clean, start):
+            entries[-1].text = clean
+            entries[-1].end_sec = max(entries[-1].end_sec, end)
+            seen.add(clean)
+            continue
+
+        entries.append(TranscriptEntry(start_sec=start, end_sec=end, text=clean))
         seen.add(clean)
-        entries.append(TranscriptEntry(
-            start_sec=_timecode_to_seconds(cap.start),
-            end_sec=_timecode_to_seconds(cap.end),
-            text=clean,
-        ))
     return entries
 
 
+def _is_rolling_caption(previous: TranscriptEntry, text: str, start: float) -> bool:
+    """True when `text` is the previous caption plus a few new words."""
+    return (
+        start <= previous.end_sec + _ROLLING_WINDOW
+        and len(text) > len(previous.text)
+        and text.startswith(previous.text)
+    )
+
+
+# The cue number is optional: some tools emit SRT blocks without it.
 _SRT_BLOCK_RE = re.compile(
-    r"\d+\r?\n"
-    r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\r?\n"
-    r"([\s\S]*?)(?=\n\s*\n|\Z)",
+    r"(?:^[ \t]*\d+[ \t]*\r?\n)?"
+    r"[ \t]*(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})[ \t]*-->[ \t]*"
+    r"(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})[^\n]*\r?\n"
+    r"([\s\S]*?)(?=\r?\n[ \t]*\r?\n|\Z)",
     re.MULTILINE,
 )
 
 
 def _parse_srt(path: Path) -> list[TranscriptEntry]:
     """Parse SRT subtitle file with pure regex."""
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
     entries = []
     for m in _SRT_BLOCK_RE.finditer(text):
         start_raw, end_raw, body = m.groups()
-        clean = _HTML_TAG_RE.sub("", body).strip()
-        clean = _WHITESPACE_RE.sub(" ", clean)
+        clean = _HTML_TAG_RE.sub("", body)
+        clean = _ASS_TAG_RE.sub("", clean)
+        clean = _WHITESPACE_RE.sub(" ", clean).strip()
         if clean:
             entries.append(TranscriptEntry(
                 start_sec=_timecode_to_seconds(start_raw),
@@ -334,8 +404,16 @@ def _parse_srt(path: Path) -> list[TranscriptEntry]:
 
 
 def _timecode_to_seconds(tc: str) -> float:
-    """Convert HH:MM:SS.mmm or HH:MM:SS,mmm to float seconds."""
-    tc = tc.strip().replace(",", ".")
-    parts = tc.split(":")
-    h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
-    return h * 3600 + m * 60 + s
+    """Convert HH:MM:SS.mmm, HH:MM:SS,mmm or MM:SS.mmm to float seconds."""
+    parts = tc.strip().replace(",", ".").split(":")
+    try:
+        values = [float(p) for p in parts]
+    except ValueError as e:
+        raise ValueError(f"invalid timecode: {tc!r}") from e
+    if len(values) == 2:
+        minutes, seconds = values
+        return minutes * 60 + seconds
+    if len(values) == 3:
+        hours, minutes, seconds = values
+        return hours * 3600 + minutes * 60 + seconds
+    raise ValueError(f"invalid timecode: {tc!r}")

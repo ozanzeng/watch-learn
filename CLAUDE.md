@@ -65,6 +65,8 @@ docs/wiki/
   Videos.md          # Analiz edilmiş videoların kayıt defteri
   *.md               # Konu bazlı wiki sayfaları
 output/              # Oluşturulan storyboard JPEG'leri
+tests/               # pytest birim testleri (ağ/ffmpeg gerektirmez)
+pyproject.toml       # Paket metadata, bağımlılıklar, ruff/pytest ayarları
 ```
 
 ## CLI Kullanımı

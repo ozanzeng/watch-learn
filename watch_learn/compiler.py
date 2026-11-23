@@ -162,15 +162,16 @@ def _frame_aspect(path: Path) -> float:
         with Image.open(path) as img:
             w, h = img.size
         return h / w if w else 9 / 16
-    except Exception:
+    except (OSError, ValueError):
         return 9 / 16
 
 
 def _load_and_fit_frame(path: Path, target_w: int, target_h: int) -> Image.Image:
     """Open frame and fit it inside (target_w, target_h) without cropping (letterbox)."""
     try:
-        img = Image.open(path).convert("RGB")
-    except Exception:
+        with Image.open(path) as src:
+            img = src.convert("RGB")
+    except (OSError, ValueError):
         # Return a dark placeholder if the frame can't be opened
         return Image.new("RGB", (target_w, target_h), (40, 40, 40))
 
@@ -196,7 +197,7 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for path in candidates:
         try:
             return ImageFont.truetype(path, size)
-        except (OSError, IOError):
+        except OSError:
             continue
     return ImageFont.load_default()
 

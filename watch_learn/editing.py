@@ -1,5 +1,6 @@
 """Edit-rhythm analysis: scene cuts, shot lengths, audio hits and loudness via ffmpeg + numpy."""
 
+import itertools
 import logging
 import re
 import subprocess
@@ -110,7 +111,7 @@ def _frame_differences(video_path: Path) -> list[float]:
 
 def shots_from_cuts(cuts: list[float], duration: float) -> list[Shot]:
     bounds = [0.0] + [c for c in cuts if 0.0 < c < duration] + [duration]
-    return [Shot(index=i + 1, start_sec=a, end_sec=b) for i, (a, b) in enumerate(zip(bounds, bounds[1:]))]
+    return [Shot(index=i + 1, start_sec=a, end_sec=b) for i, (a, b) in enumerate(itertools.pairwise(bounds))]
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ def _loudness(video_path: Path) -> tuple[float | None, float | None, float | Non
         "ffmpeg", "-hide_banner", "-nostats", "-i", str(video_path), "-vn",
         "-af", "ebur128=peak=true:framelog=quiet", "-f", "null", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     summary = result.stderr[result.stderr.rfind("Summary:"):] if "Summary:" in result.stderr else ""
 
     def grab(rx: re.Pattern) -> float | None:
@@ -151,7 +152,7 @@ def _decode_mono(video_path: Path, sr: int) -> np.ndarray | None:
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
         "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True, check=False)
     if result.returncode != 0 or not result.stdout:
         return None
     return np.frombuffer(result.stdout, dtype=np.float32)
@@ -208,6 +209,10 @@ def _estimate_tempo(env: np.ndarray, lo_bpm: float = 70.0, hi_bpm: float = 180.0
     n = len(e)
     if n < 4:
         return None
+    # A flat envelope (silence, steady tone) has no periodic peaks to lock onto;
+    # argmax would otherwise return the first lag and report a bogus tempo.
+    if not np.any(e):
+        return None
     spec = np.fft.rfft(e, 2 * n)
     ac = np.fft.irfft(spec * np.conj(spec))[:n]
     lag_lo = int(60.0 / hi_bpm / step)
@@ -254,8 +259,10 @@ def burst_summary(bursts: list[tuple[float, float]], burst_gap: float = 0.25) ->
     spans = " · ".join(f"{_mmss(a, frac=True)}-{_mmss(b, frac=True)}" for a, b in bursts[:12])
     more = f" (+{len(bursts) - 12})" if len(bursts) > 12 else ""
     return [
-        f"- Hızlı hareket ya da efektli geçiş: {len(bursts)} bölge, her biri tek kesim sayıldı"
-        f" ({burst_gap:g} sn'den sık ardışık tespitler): {spans}{more}"
+        (
+            f"- Hızlı hareket ya da efektli geçiş: {len(bursts)} bölge, her biri tek kesim sayıldı"
+            f" ({burst_gap:g} sn'den sık ardışık tespitler): {spans}{more}"
+        )
     ]
 
 
@@ -264,13 +271,18 @@ def rhythm_summary(shots: list[Shot], duration: float) -> list[str]:
     lengths = np.array([s.duration for s in shots])
     lines = [
         f"- Plan sayısı: {len(shots)} · dakikada {60 * max(0, len(shots) - 1) / duration:.1f} kesim",
-        f"- Plan süresi: ortalama {lengths.mean():.2f} sn · medyan {np.median(lengths):.2f} sn"
-        f" · en kısa {lengths.min():.2f} sn · en uzun {lengths.max():.2f} sn",
+        (
+            f"- Plan süresi: ortalama {lengths.mean():.2f} sn · medyan {np.median(lengths):.2f} sn"
+            f" · en kısa {lengths.min():.2f} sn · en uzun {lengths.max():.2f} sn"
+        ),
     ]
     edges = [0, 0.5, 1, 2, 4, 8, float("inf")]
     labels = ["<0.5", "0.5-1", "1-2", "2-4", "4-8", "8+"]
     counts = np.histogram(lengths, bins=edges)[0]
-    lines.append("- Dağılım (sn): " + " · ".join(f"{l}: {c}" for l, c in zip(labels, counts)))
+    lines.append(
+        "- Dağılım (sn): "
+        + " · ".join(f"{label}: {count}" for label, count in zip(labels, counts, strict=True))
+    )
 
     window = 30.0 if duration > 120 else 10.0
     parts = []
@@ -308,7 +320,7 @@ def audio_summary(stats: AudioStats, cuts: list[float], duration: float) -> list
 
 def shot_table(shots: list[Shot], texts: list[str]) -> list[str]:
     lines = ["| # | Başlangıç | Süre | Konuşma |", "|---|---|---|---|"]
-    for shot, text in zip(shots, texts):
+    for shot, text in zip(shots, texts, strict=True):
         clean = text.replace("|", "/")[:80]
         lines.append(f"| {shot.index} | {_mmss(shot.start_sec, frac=True)} | {shot.duration:.2f} sn | {clean} |")
     return lines

@@ -24,7 +24,7 @@ def check_ffmpeg() -> str:
     if homebrew_path.exists():
         return str(homebrew_path)
 
-    raise EnvironmentError(
+    raise OSError(
         "ffmpeg not found. Install it with:\n"
         "  macOS:  brew install ffmpeg\n"
         "  Ubuntu: sudo apt install ffmpeg\n"
@@ -48,9 +48,10 @@ def get_video_duration(video_path: Path) -> float | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         return float(result.stdout.strip())
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
@@ -70,10 +71,11 @@ def get_video_fps(video_path: Path) -> float | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         num, _, den = result.stdout.strip().partition("/")
         return float(num) / float(den or 1)
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
@@ -130,6 +132,7 @@ def _extract_single_frame(
             capture_output=True,
             text=True,
             timeout=_FFMPEG_TIMEOUT,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         logger.warning(f"ffmpeg timed out at {time_sec:.1f}s")
@@ -140,7 +143,4 @@ def _extract_single_frame(
         return False
 
     # Reject suspiciously small files (black frame / seek past end of video)
-    if not output_path.exists() or output_path.stat().st_size < _MIN_FRAME_BYTES:
-        return False
-
-    return True
+    return output_path.exists() and output_path.stat().st_size >= _MIN_FRAME_BYTES

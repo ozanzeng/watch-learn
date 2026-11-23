@@ -1,5 +1,9 @@
 # Watch & Learn
 
+[![CI](https://github.com/ozanzeng/watch-learn/actions/workflows/ci.yml/badge.svg)](https://github.com/ozanzeng/watch-learn/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 YouTube videolarını Claude Code'a "izlettiren" bir pipeline. Transcript + ekran görüntülerini birleştirerek bir storyboard grid oluşturur, Claude bunu Vision LLM ile analiz eder ve bilgileri `docs/wiki/` altında Obsidian formatında saklar.
 
 ## Nasıl Çalışır
@@ -44,9 +48,11 @@ source .venv/bin/activate      # macOS/Linux
 ### 3. Bağımlılıkları yükle
 
 ```bash
-pip install -r requirements.txt
 pip install -e .
 ```
+
+`requirements.txt` yalnızca sabit sürüm listesi isteyen ortamlar için tutulur;
+asıl bağımlılık tanımı `pyproject.toml` içindedir.
 
 ### 4. spaCy dil modelini indir
 
@@ -147,6 +153,7 @@ https://www.youtube.com/watch?v=VIDEO_ID
 | `--keep-temp` | kapalı | Geçici video/frame dosyalarını sakla |
 | `--no-learn` | kapalı | Bu çalıştırmada keyword öğrenmesini atla |
 | `--verbose / -v` | kapalı | Debug log'larını göster |
+| `--version` | — | Sürümü yazdır ve çık |
 
 ## Proje Yapısı
 
@@ -171,6 +178,11 @@ docs/wiki/
 
 data/
   keyword_store.json   # Self-learning keyword veritabanı
+
+tests/                 # pytest — ağ/ffmpeg gerektirmeyen birim testleri
+
+pyproject.toml         # Paket metadata, bağımlılıklar, ruff/pytest ayarları
+LICENSE                # MIT
 
 output/
   VIDEO_ID/
@@ -244,3 +256,21 @@ Frame'ler kırpılmadan, kaynağın en-boy oranıyla yerleştirilir. Dikey video
 | `Cannot access video` | Video private, yaş kısıtlı veya bölge engelinde olabilir |
 | Transcript bulunamadı | `WHISPER_CPP_MODEL` ile yerel whisper.cpp ya da `--groq-api-key` ile Groq kullan |
 | `Module import error` | Venv aktif mi kontrol et: `source .venv/bin/activate && pip install -e .` |
+
+## Geliştirme
+
+```bash
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+ruff check watch_learn tests   # lint
+pytest                         # testler
+pytest --cov=watch_learn       # kapsam raporu
+```
+
+Testler ağa çıkmaz ve ffmpeg gerektirmez; yalnızca saf fonksiyonları (transcript
+parse, timestamp seçimi, grid yerleşimi, plan/ritim özetleri) doğrular.
+
+## Lisans
+
+[MIT](LICENSE) © 2026 Ozan Zengin

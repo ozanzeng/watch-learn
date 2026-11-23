@@ -8,14 +8,15 @@ from pathlib import Path
 
 import click
 
+from . import __version__
 from .extractor import check_ffmpeg, get_video_duration
-
 
 MAX_SHOT_FRAMES = 150  # shot storyboard pages beyond this get sampled evenly
 LONG_SHOT_STEP = 3.0   # seconds between extra frames inside long shots
 
 
 @click.command()
+@click.version_option(version=__version__, prog_name="watch-learn")
 @click.argument("url")
 @click.option(
     "--output-dir", "-o",
@@ -184,7 +185,7 @@ def cli(
         fixed_count = _estimate_fixed_count(duration)
         if interval:
             log.info(f"Step 2/{steps} ▸ Taking a frame every {interval:g}s...")
-            timestamps = interval_timestamps(entries, duration, interval)
+            timestamps = interval_timestamps(entries, duration, interval, limit=max_frames)
         else:
             log.info(f"Step 2/{steps} ▸ Analyzing transcript for smart timestamps...")
             timestamps = extract_smart_timestamps(
@@ -194,7 +195,7 @@ def cli(
             )
             if not timestamps and duration:
                 # Nothing to steer by (no speech): spread the frame budget evenly
-                timestamps = interval_timestamps(entries, duration, max(2.0, duration / max_frames))
+                timestamps = interval_timestamps(entries, duration, max(2.0, duration / max_frames), limit=max_frames)
             elif duration:
                 # Long stretches without a keyword or pause would otherwise get no frame at all
                 timestamps = fill_gaps(timestamps, entries, duration, max(10.0, duration / max_frames), max_frames)
@@ -266,7 +267,7 @@ def cli(
     except ValueError as exc:
         logging.getLogger("watch_learn").error(f"Video error: {exc}")
         raise click.Abort() from exc
-    except EnvironmentError as exc:
+    except (OSError, RuntimeError) as exc:
         logging.getLogger("watch_learn").error(str(exc))
         raise click.Abort() from exc
     finally:
@@ -290,7 +291,13 @@ def _analyze_edit(
     from .analyzer import text_at
     from .compiler import compile_storyboards
     from .editing import (
-        analyze_audio, audio_summary, burst_summary, detect_cuts, rhythm_summary, shot_table, shots_from_cuts,
+        analyze_audio,
+        audio_summary,
+        burst_summary,
+        detect_cuts,
+        rhythm_summary,
+        shot_table,
+        shots_from_cuts,
     )
     from .extractor import extract_frames
 

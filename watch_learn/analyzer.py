@@ -1,14 +1,19 @@
 """NLP-powered timestamp extraction with a self-learning keyword store."""
 
+import bisect
+import itertools
 import json
 import logging
+import os
+from functools import lru_cache
 from pathlib import Path
 
 from . import KeywordEntry, KeywordStore, SmartTimestamp, TranscriptEntry
 
 logger = logging.getLogger(__name__)
 
-STORE_PATH = Path(__file__).parent.parent / "data" / "keyword_store.json"
+_DATA_DIR = Path(os.environ.get("WATCH_LEARN_DATA_DIR", Path(__file__).parent.parent / "data"))
+STORE_PATH = _DATA_DIR / "keyword_store.json"
 SILENCE_GAP_DEFAULT = 5.0
 MIN_SPACING = 2.0
 
@@ -68,14 +73,16 @@ _DEFAULT_DOMAIN_CLUSTERS: dict[str, list[str]] = {
 def load_keyword_store(path: Path = STORE_PATH) -> KeywordStore:
     if path.exists():
         try:
-            raw = json.loads(path.read_text())
+            raw = json.loads(path.read_text(encoding="utf-8"))
             keywords = [KeywordEntry(**k) for k in raw.get("keywords", [])]
-            return KeywordStore(
+            store = KeywordStore(
                 version=raw.get("version", 1),
                 keywords=keywords,
                 domain_clusters=raw.get("domain_clusters", _DEFAULT_DOMAIN_CLUSTERS),
             )
-        except Exception as e:
+            _ensure_builtin_keywords(store)
+            return store
+        except (OSError, ValueError, TypeError, KeyError) as e:
             logger.warning(f"Failed to load keyword store ({e}), using defaults")
 
     return KeywordStore(
@@ -83,6 +90,14 @@ def load_keyword_store(path: Path = STORE_PATH) -> KeywordStore:
         keywords=[KeywordEntry(phrase=p, weight=w, source="builtin") for p, w in _BUILTIN_KEYWORDS],
         domain_clusters=_DEFAULT_DOMAIN_CLUSTERS,
     )
+
+
+def _ensure_builtin_keywords(store: KeywordStore) -> None:
+    """Keep the builtin phrases even when an older/partial store file is loaded."""
+    present = {k.phrase.lower() for k in store.keywords}
+    for phrase, weight in _BUILTIN_KEYWORDS:
+        if phrase not in present:
+            store.keywords.append(KeywordEntry(phrase=phrase, weight=weight, source="builtin"))
 
 
 def save_keyword_store(store: KeywordStore, path: Path = STORE_PATH) -> None:
@@ -95,7 +110,10 @@ def save_keyword_store(store: KeywordStore, path: Path = STORE_PATH) -> None:
         ],
         "domain_clusters": store.domain_clusters,
     }
-    path.write_text(json.dumps(data, indent=2))
+    # Write to a sibling temp file first so an interrupted run cannot corrupt the store.
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +166,14 @@ def _extract_keyword_timestamps(
         for t in terms:
             cluster_terms[t.lower()] = 0.6
 
-    for entry in entries:
+    # One batched spaCy pass is much faster than nlp() per entry on long videos.
+    docs = (
+        list(nlp.pipe((entry.text for entry in entries), batch_size=32))
+        if nlp is not None
+        else [None] * len(entries)
+    )
+
+    for entry, doc in zip(entries, docs, strict=True):
         text_lower = entry.text.lower()
         matched_reason: str | None = None
         best_weight = 0.0
@@ -160,8 +185,7 @@ def _extract_keyword_timestamps(
                 best_weight = kentry.weight
 
         # 2. Domain cluster term matching
-        if nlp is not None:
-            doc = nlp(entry.text)
+        if doc is not None:
             for token in doc:
                 term = token.lemma_.lower()
                 if term in cluster_terms and cluster_terms[term] > best_weight:
@@ -178,7 +202,7 @@ def _extract_keyword_timestamps(
                         # Check for a nearby demonstrative or deictic word
                         context = [t.lower_ for t in doc[max(0, token.i-2):token.i+4]]
                         if any(d in context for d in ("this", "here", "that", "there", "these", "those")):
-                            matched_reason = f"spacy:deictic_verb"
+                            matched_reason = "spacy:deictic_verb"
                             best_weight = 0.75
                             break
 
@@ -192,12 +216,14 @@ def _extract_keyword_timestamps(
     return results
 
 
+@lru_cache(maxsize=1)
 def _get_spacy_nlp():
-    """Load spaCy model, return None if unavailable (graceful degradation)."""
+    """Load spaCy model once, return None if unavailable (graceful degradation)."""
     try:
         import spacy
         return spacy.load("en_core_web_sm")
     except Exception as e:
+        # Any load failure (missing model, incompatible version) degrades to string matching.
         logger.warning(f"spaCy unavailable ({e}); falling back to string matching only")
         return None
 
@@ -252,7 +278,7 @@ def _deduplicate_timestamps(
 
 
 def _reason_priority(reason: str) -> int:
-    if reason.startswith("keyword") or reason.startswith("spacy"):
+    if reason.startswith(("keyword", "spacy")):
         return 2
     if reason == "combined":
         return 3
@@ -297,13 +323,21 @@ def interval_timestamps(
     duration: float,
     interval: float,
     start: float = 0.0,
+    limit: int | None = None,
 ) -> list[SmartTimestamp]:
-    """One timestamp every `interval` seconds, captioned with the speech at that moment."""
+    """One timestamp every `interval` seconds, captioned with the speech at that moment.
+
+    `limit` caps the result (the pipeline passes --max-frames) by sampling evenly,
+    so `--interval 1` on a long video cannot produce thousands of frames.
+    """
     times: list[float] = []
     t = start + min(interval / 2, 1.0)
     while t < duration:
         times.append(t)
         t += interval
+    if limit is not None and limit > 0 and len(times) > limit:
+        step = len(times) / limit
+        times = [times[int(i * step)] for i in range(limit)]
     return [
         SmartTimestamp(time_sec=t, reason=f"interval:{interval:g}s", transcript_text=text_at(entries, t))
         for t in times
@@ -319,16 +353,20 @@ def fill_gaps(
 ) -> list[SmartTimestamp]:
     """Add evenly spaced frames inside stretches longer than `max_gap`, up to `limit` in total."""
     room = limit - len(timestamps)
-    if room <= 0:
+    if room <= 0 or max_gap <= 0:
         return timestamps
 
     bounds = [0.0] + [t.time_sec for t in timestamps] + [duration]
     extra: list[SmartTimestamp] = []
-    for a, b in zip(bounds, bounds[1:]):
+    for a, b in itertools.pairwise(bounds):
         n = int((b - a) // max_gap)
         for k in range(1, n + 1):
             t = a + (b - a) * k / (n + 1)
-            extra.append(SmartTimestamp(time_sec=t, reason=f"gap_fill:{max_gap:g}s", transcript_text=text_at(entries, t)))
+            extra.append(SmartTimestamp(
+                time_sec=t,
+                reason=f"gap_fill:{max_gap:g}s",
+                transcript_text=text_at(entries, t),
+            ))
     if len(extra) > room:
         step = len(extra) / room
         extra = [extra[int(i * step)] for i in range(room)]
@@ -386,8 +424,8 @@ def update_keyword_store(
         return 0
 
     try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
         import numpy as np
+        from sklearn.feature_extraction.text import TfidfVectorizer
     except ImportError:
         logger.warning("scikit-learn not available — skipping keyword store update")
         return 0
@@ -396,13 +434,16 @@ def update_keyword_store(
     existing_phrases = {k.phrase.lower() for k in store.keywords}
 
     # Build "selected" windows (±10s around each timestamp)
-    selected_times = {ts.time_sec for ts in selected_timestamps}
+    selected_times = sorted(ts.time_sec for ts in selected_timestamps)
     selected_texts: list[str] = []
     background_texts: list[str] = []
 
+    def near_selected(t: float) -> bool:
+        i = bisect.bisect_left(selected_times, t - 10.0)
+        return i < len(selected_times) and selected_times[i] <= t + 10.0
+
     for entry in entries:
-        near_selected = any(abs(entry.start_sec - t) <= 10.0 for t in selected_times)
-        bucket = selected_texts if near_selected else background_texts
+        bucket = selected_texts if near_selected(entry.start_sec) else background_texts
         bucket.append(entry.text)
 
     if not selected_texts or not background_texts:
@@ -423,11 +464,12 @@ def update_keyword_store(
         selected_scores = tfidf[0].toarray()[0]
         background_scores = tfidf[1].toarray()[0]
         lift = selected_scores - background_scores
-    except Exception as e:
+    except ValueError as e:
         logger.warning(f"TF-IDF failed: {e}")
         return 0
 
     added = 0
+    changed = False
     for idx in np.argsort(lift)[::-1]:
         phrase = feature_names[idx]
         is_bigram = " " in phrase
@@ -452,6 +494,7 @@ def update_keyword_store(
             for k in store.keywords:
                 if k.phrase.lower() == phrase and k.source == "learned":
                     k.occurrences += 1
+                    changed = True
                     if k.occurrences >= 3 and k.weight < 0.8:
                         k.weight = 0.8
                         logger.info(f"Promoted keyword '{phrase}' to weight 0.8")
@@ -464,12 +507,13 @@ def update_keyword_store(
             occurrences=1,
         ))
         existing_phrases.add(phrase)
+        changed = True
         logger.info(f"Learned keyword: '{phrase}' ({'bigram' if is_bigram else 'unigram'}, lift={lift[idx]:.3f})")
         added += 1
         if added >= 10:
             break
 
-    if added > 0:
+    if changed:
         save_keyword_store(store, store_path)
 
     return added

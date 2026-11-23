@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+__version__ = "0.2.0"
+
 
 @dataclass
 class TranscriptEntry:
