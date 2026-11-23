@@ -65,9 +65,9 @@ watch-learn "<YOUTUBE_URL>" \
 | `--interval / -i` | — | One frame every N seconds instead of transcript-driven picks |
 | `--cuts` | off | Edit-rhythm analysis: cuts, one frame per shot (`shots_page_*.jpg`), audio hits, loudness |
 | `--cut-threshold` | `3.0` | How many times more a frame must change than its neighbours to be a cut |
-| `--keep-video` | off | Copy the downloaded video to the output folder as `video.mp4` |
+| `--keep-video` | off | Keep the downloaded video as `output/<ID>/video.mp4`; by default the raw download is deleted after the run |
 | `--no-learn` | off | Skip self-learning keyword store update |
-| `--keep-temp` | off | Keep raw frames and video file |
+| `--keep-temp` | off | Keep raw frames and the temp video file |
 | `--verbose / -v` | off | Show per-timestamp debug output |
 
 The URL may also be a local video file (a sidecar `.srt`/`.vtt` is used as the transcript). Every run writes `report.md` and `transcript.txt` next to the storyboards. With `--cuts`, `report.md` adds the following, so compare the alignment share against the chance figure before calling an edit "on the beat":

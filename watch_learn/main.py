@@ -250,6 +250,11 @@ def cli(
             if new_kw:
                 log.info(f"          Keyword store: learned {new_kw} new term(s) from this video")
 
+        # Learning is done: the raw download is no longer needed (storyboards and
+        # transcript are already on disk). Local input files are never touched.
+        if _discard_downloaded_video(result, keep_video=keep_video, keep_temp=keep_temp):
+            log.info("          Raw video deleted (frames + report kept)")
+
         elapsed = time.time() - t_start
         log.info("=" * 62)
         log.info(f"  Done in {elapsed:.1f}s")
@@ -342,6 +347,26 @@ def _analyze_edit(
     lines += ["", "## Ses", ""] + audio_summary(audio, cut_times, duration)
     lines += ["", "## Plan listesi", ""] + shot_table(shots, texts)
     return boards, lines
+
+
+def _discard_downloaded_video(result, keep_video: bool, keep_temp: bool) -> bool:
+    """Delete the downloaded source video once storyboards and reports are written.
+
+    Only files inside this run's temp directory are removed, so a user-provided
+    local video (and an explicit --keep-video copy) is never touched. Returns True
+    when a file was deleted.
+    """
+    if keep_video or keep_temp:
+        return False
+    path = result.video_path
+    if path.parent != result.temp_dir or not path.exists():
+        return False
+    try:
+        path.unlink()
+    except OSError as exc:
+        logging.getLogger("watch_learn").warning(f"Could not delete downloaded video: {exc}")
+        return False
+    return True
 
 
 def _report_header(url: str, result, duration: float, frames: list, boards: list[Path]) -> list[str]:

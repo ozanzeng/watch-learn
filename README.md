@@ -101,7 +101,7 @@ watch-learn "https://www.youtube.com/watch?v=VIDEO_ID" \
   --verbose
 ```
 
-Storyboard JPEG'leri `output/VIDEO_ID/` altına kaydedilir. Aynı klasöre `report.md` (süre, çözünürlük, fps, transkript kaynağı) ve `transcript.txt` (zaman damgalı tam metin) de yazılır.
+Storyboard JPEG'leri `output/VIDEO_ID/` altına kaydedilir. Aynı klasöre `report.md` (süre, çözünürlük, fps, transkript kaynağı) ve `transcript.txt` (zaman damgalı tam metin) de yazılır. İndirilen ham video, kareler ve rapor yazıldıktan sonra otomatik silinir; diskte yalnızca çıktılar kalır. Videoyu sonradan ayrıntılı kare çalışması için saklamak isterseniz `--keep-video` kullanın.
 
 URL yerine yerel bir video dosyası da verilebilir. Yanında aynı adlı `.srt`/`.vtt` varsa transkript olarak o kullanılır, yoksa ses yazıya dökülür:
 
@@ -112,7 +112,7 @@ watch-learn ~/Movies/IMG_1234.MOV --interval 1 --lang tr
 ### Kurgu ritmi analizi
 
 ```bash
-watch-learn "https://www.youtube.com/watch?v=VIDEO_ID" --cuts --keep-video
+watch-learn "https://www.youtube.com/watch?v=VIDEO_ID" --cuts
 ```
 
 `--cuts` montaj ve kurgu referansları içindir. Şunları üretir:
@@ -149,7 +149,7 @@ https://www.youtube.com/watch?v=VIDEO_ID
 | `--cut-threshold` | `3.0` | Bir frame'in komşularına göre kaç kat değişince kesim sayılacağı |
 | `--whisper-model` | env `WHISPER_CPP_MODEL` | Altyazısız videolar için yerel whisper.cpp ggml modeli |
 | `--lang` | `auto` | whisper.cpp konuşma dili (`tr`, `en`, `auto`) |
-| `--keep-video` | kapalı | İndirilen videoyu çıktı klasörüne `video.mp4` olarak kopyala |
+| `--keep-video` | kapalı | Ham videoyu `output/<ID>/video.mp4` olarak sakla (varsayılan: öğrenme bitince silinir) |
 | `--keep-temp` | kapalı | Geçici video/frame dosyalarını sakla |
 | `--no-learn` | kapalı | Bu çalıştırmada keyword öğrenmesini atla |
 | `--verbose / -v` | kapalı | Debug log'larını göster |
